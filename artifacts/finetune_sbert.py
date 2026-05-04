@@ -1,225 +1,216 @@
 """
-finetune_sbert.py
-
-Fine-tune an SBERT bi-encoder on top of your MLM checkpoint using SimCSE-style contrastive learning.
-This improves retrieval embeddings by learning that semantically similar notes are close.
+Fine-tunes Bio_ClinicalBERT as a SimCSE bi-encoder on synthetic clinical notes.
 
 Usage:
-    python artifacts/finetune_sbert.py --mlm_checkpoint auto \
-        --output_dir artifacts/sbert_bi_encoder --num_train_epochs 3
+    python artifacts/finetune_sbert.py
+    python artifacts/finetune_sbert.py --force_retrain
 """
 
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from datasets import Dataset
 from torch import nn
 from transformers import AutoModel, AutoTokenizer, Trainer, TrainingArguments, set_seed
 
-DEFAULT_LOCAL_CHECKPOINT = "artifacts/mini_biobert_mlm"
-DEFAULT_REMOTE_FALLBACKS = [
-    "emilyalsentzer/Bio_ClinicalBERT",
-    "dmis-lab/biobert-base-cased-v1.1",
-    "bert-base-uncased",
-]
+
+DEFAULT_CHECKPOINT = "emilyalsentzer/Bio_ClinicalBERT"
 
 
 class BertSentenceTransformer(nn.Module):
-    """Simple BERT-based bi-encoder: BERT -> mean pooling -> optional projection -> normalize."""
+    """BERT bi-encoder: mean pooling -> optional projection -> L2-normalize."""
 
     def __init__(self, model_name_or_path: str, projection_dim: int = 384, dropout_p: float = 0.1):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(model_name_or_path)
-        hidden_size = self.encoder.config.hidden_size
+        hidden_size  = self.encoder.config.hidden_size
 
-        if projection_dim != hidden_size:
-            self.projection = nn.Linear(hidden_size, projection_dim)
-        else:
-            self.projection = None
-
+        self.projection = (
+            nn.Sequential(nn.Linear(hidden_size, projection_dim), nn.LayerNorm(projection_dim))
+            if projection_dim < hidden_size else None
+        )
         self.dropout = nn.Dropout(dropout_p)
 
+    def gradient_checkpointing_enable(self, **kwargs):
+        self.encoder.gradient_checkpointing_enable(**kwargs)
+
+    def gradient_checkpointing_disable(self):
+        self.encoder.gradient_checkpointing_disable()
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        return getattr(self.encoder, "is_gradient_checkpointing", False)
+
     def forward(self, input_ids, attention_mask, token_type_ids=None):
-        outputs = self.encoder(
+        out = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
         )
-        last_hidden = outputs.last_hidden_state
-
-        mask = attention_mask.unsqueeze(-1).float()
-        pooled = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-
-        if self.projection is not None:
-            pooled = self.projection(pooled)
+        last_hidden = out.last_hidden_state
+        mask   = attention_mask.unsqueeze(-1).float()
+        pooled = (last_hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
 
         if self.training:
             pooled = self.dropout(pooled)
+        if self.projection is not None:
+            pooled = self.projection(pooled)
 
         return torch.nn.functional.normalize(pooled, p=2, dim=1)
 
 
 def load_notes(jsonl_path: Path):
-    texts = []
     with jsonl_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            texts.append(json.loads(line)["text"])
-    return texts
+        return [json.loads(l)["text"] for l in f]
 
 
 def compute_metrics(_) -> Dict[str, Any]:
     return {}
 
 
-def resolve_checkpoint(checkpoint_arg: str) -> str:
-    """
-    Resolve model checkpoint for fast-path training:
-    - explicit value: use as-is
-    - auto: prefer local MLM checkpoint if present, else use first remote fallback
-    """
-    if checkpoint_arg != "auto":
-        return checkpoint_arg
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        return torch.device("cuda")
+    print("CUDA not available — using CPU (training will be slow).")
+    return torch.device("cpu")
 
-    if Path(DEFAULT_LOCAL_CHECKPOINT).exists():
-        print(f"Using local checkpoint: {DEFAULT_LOCAL_CHECKPOINT}")
-        return DEFAULT_LOCAL_CHECKPOINT
 
-    fallback = DEFAULT_REMOTE_FALLBACKS[0]
-    print(f"Local checkpoint not found. Falling back to remote checkpoint: {fallback}")
-    return fallback
+def model_already_exists(output_dir: str) -> bool:
+    out = Path(output_dir)
+    return out.exists() and any(
+        f.suffix in (".safetensors", ".bin") for f in out.iterdir()
+    )
 
 
 def main(
-    mlm_checkpoint: str = "auto",
-    output_dir: str = "artifacts/sbert_bi_encoder",
-    num_train_epochs: int = 3,
-    per_device_train_batch_size: int = 32,
-    gradient_accumulation_steps: int = 1,
-    learning_rate: float = 2e-5,
-    warmup_steps: int = 100,
-    max_len: int | None = None,
-    projection_dim: int = 384,
-    seed: int = 42,
+    mlm_checkpoint: str           = DEFAULT_CHECKPOINT,
+    output_dir: str               = "artifacts/sbert_bi_encoder",
+    num_train_epochs: int         = 5,
+    per_device_train_batch_size: int = 16,
+    gradient_accumulation_steps: int = 4,
+    learning_rate: float          = 2e-5,
+    warmup_ratio: float           = 0.1,
+    max_len: Optional[int]        = 256,
+    projection_dim: int           = 384,
+    temperature: float            = 0.05,
+    seed: int                     = 42,
+    force_retrain: bool           = False,
 ):
+    if not force_retrain and model_already_exists(output_dir):
+        print(f"Fine-tuned model already exists at '{output_dir}'.")
+        print("Pass --force_retrain to overwrite it.")
+        return
+
     set_seed(seed)
-    resolved_checkpoint = resolve_checkpoint(mlm_checkpoint)
+    device = get_device()
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    print(f"Base model: {mlm_checkpoint}")
 
     in_jsonl = Path("data/corpus/synthea_notes.jsonl")
-    texts = load_notes(in_jsonl)
-    print(f"Loaded {len(texts)} texts for SBERT fine-tuning.")
+    if not in_jsonl.exists():
+        raise FileNotFoundError(f"Missing {in_jsonl}. Run make_notes_from_csv.py first.")
 
-    dataset = Dataset.from_dict({"text": texts})
-    dataset = dataset.train_test_split(test_size=0.1, seed=seed)
+    texts   = load_notes(in_jsonl)
+    print(f"Loaded {len(texts)} notes.")
 
-    tokenizer = AutoTokenizer.from_pretrained(resolved_checkpoint)
-    model = BertSentenceTransformer(resolved_checkpoint, projection_dim=projection_dim, dropout_p=0.1)
-    model_max_len = int(model.encoder.config.max_position_embeddings)
-    effective_max_len = model_max_len if max_len is None else min(max_len, model_max_len)
-    print(f"Tokenization max_len={effective_max_len} (model limit={model_max_len})")
+    dataset  = Dataset.from_dict({"text": texts}).train_test_split(test_size=0.1, seed=seed)
+
+    tokenizer     = AutoTokenizer.from_pretrained(mlm_checkpoint)
+    model         = BertSentenceTransformer(mlm_checkpoint, projection_dim, dropout_p=0.1).to(device)
+    model_max_len = model.encoder.config.max_position_embeddings
+    eff_max_len   = model_max_len if max_len is None else min(max_len, model_max_len)
+    print(f"max_len={eff_max_len}  (model limit={model_max_len})")
 
     def tokenize_fn(batch):
-        encoded = tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=effective_max_len,
-            padding="max_length",
-            return_tensors="pt",
+        enc = tokenizer(
+            batch["text"], truncation=True,
+            max_length=eff_max_len, padding="max_length", return_tensors="pt",
         )
-        return {k: v.tolist() for k, v in encoded.items()}
+        return {k: v.tolist() for k, v in enc.items()}
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
 
     class SBERTTrainer(Trainer):
-        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-            # Two independent forward passes create the positive pair via dropout noise.
-            z1 = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                token_type_ids=inputs.get("token_type_ids"),
-            )
-            z2 = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                token_type_ids=inputs.get("token_type_ids"),
-            )
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.can_return_loss = True
 
-            temperature = 0.05
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            ids   = inputs["input_ids"]
+            mask  = inputs["attention_mask"]
+            ttype = inputs["token_type_ids"] if "token_type_ids" in inputs else None
+
+            # same note run twice with different dropout masks gives us a positive pair (SimCSE)
+            z1 = model(input_ids=ids, attention_mask=mask, token_type_ids=ttype)
+            z2 = model(input_ids=ids, attention_mask=mask, token_type_ids=ttype)
+
             logits_12 = torch.mm(z1, z2.t()) / temperature
             logits_21 = torch.mm(z2, z1.t()) / temperature
+            labels    = torch.arange(z1.size(0), device=z1.device)
+            loss_fn   = nn.CrossEntropyLoss()
+            loss      = 0.5 * (loss_fn(logits_12, labels) + loss_fn(logits_21, labels))
+            return (loss, logits_12) if return_outputs else loss
 
-            labels = torch.arange(z1.size(0), device=z1.device)
-            loss_fn = torch.nn.CrossEntropyLoss()
-            loss = 0.5 * (loss_fn(logits_12, labels) + loss_fn(logits_21, labels))
-            return (loss, {"embeddings_view1": z1, "embeddings_view2": z2}) if return_outputs else loss
-
-    args = TrainingArguments(
+    training_args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=per_device_train_batch_size,
         num_train_epochs=num_train_epochs,
         learning_rate=learning_rate,
-        warmup_steps=warmup_steps,
+        warmup_ratio=warmup_ratio,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=True,
         logging_steps=50,
-        eval_steps=500,
+        eval_steps=200,
         eval_strategy="steps",
-        save_steps=500,
+        save_steps=200,
         save_total_limit=2,
-        load_best_model_at_end=False,
-        fp16=torch.cuda.is_available(),
-        dataloader_num_workers=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        fp16=(device.type == "cuda"),
+        dataloader_num_workers=0,
         report_to="none",
     )
 
     trainer = SBERTTrainer(
         model=model,
-        args=args,
+        args=training_args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["test"],
         compute_metrics=compute_metrics,
     )
 
     trainer.train()
-    trainer.save_model(output_dir)
+
+    # save only the inner encoder so AutoModel.from_pretrained works at inference time
+    model.encoder.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    print(f"Saved SBERT bi-encoder to: {output_dir}")
+    print(f"\nSaved fine-tuned encoder to: {output_dir}")
+    print("Next step: python build_index.py")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Fine-tune SBERT bi-encoder on clinical notes")
-    p.add_argument(
-        "--mlm_checkpoint",
-        type=str,
-        default="auto",
-        help=(
-            "Base checkpoint path/name. Use 'auto' to prefer local artifacts/mini_biobert_mlm "
-            "and fallback to emilyalsentzer/Bio_ClinicalBERT."
-        ),
-    )
-    p.add_argument("--output_dir", type=str, default="artifacts/sbert_bi_encoder")
-    p.add_argument("--num_train_epochs", type=int, default=3)
-    p.add_argument("--per_device_train_batch_size", type=int, default=32)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    p.add_argument("--learning_rate", type=float, default=2e-5)
-    p.add_argument("--warmup_steps", type=int, default=100)
-    p.add_argument("--max_len", type=int, default=None)
-    p.add_argument("--projection_dim", type=int, default=384)
-    p.add_argument("--seed", type=int, default=42)
+    p = argparse.ArgumentParser()
+    p.add_argument("--mlm_checkpoint",              default=DEFAULT_CHECKPOINT)
+    p.add_argument("--output_dir",                  default="artifacts/sbert_bi_encoder")
+    p.add_argument("--num_train_epochs",  type=int,   default=5)
+    p.add_argument("--per_device_train_batch_size", type=int, default=16)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    p.add_argument("--learning_rate",     type=float, default=2e-5)
+    p.add_argument("--warmup_ratio",      type=float, default=0.1)
+    p.add_argument("--max_len",           type=int,   default=256)
+    p.add_argument("--projection_dim",    type=int,   default=384)
+    p.add_argument("--temperature",       type=float, default=0.05)
+    p.add_argument("--seed",              type=int,   default=42)
+    p.add_argument("--force_retrain",     action="store_true",
+                   help="Overwrite existing model and retrain from scratch.")
     args = p.parse_args()
-
-    main(
-        mlm_checkpoint=args.mlm_checkpoint,
-        output_dir=args.output_dir,
-        num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        warmup_steps=args.warmup_steps,
-        max_len=args.max_len,
-        projection_dim=args.projection_dim,
-        seed=args.seed,
-    )
-
+    main(**vars(args))
